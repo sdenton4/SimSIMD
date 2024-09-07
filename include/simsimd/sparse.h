@@ -168,17 +168,17 @@ SIMSIMD_PUBLIC void simsimd_intersect_u16_ice(simsimd_u16_t const* shorter, sims
 
     // We will be walking through batches of elements from the shorter array,
     // and comparing them with the longer array. The first element of the shorter
-    // array will be broadcasted to a vector. As there is no cheap "permutevar"-like
-    // instruction in AVX512, we will have to use `vpshufb` via `_mm512_shuffle_epi8`,
-    // to load the 1st and 2nd byte of the first element into each 16-bit word.
+    // array will be broadcasted to a vector. As there is no cheap `_mm512_permutexvar_epi16`-like
+    // instruction in AVX512, we couldt try using `vpshufb` via `_mm512_shuffle_epi8`,
+    // to load the 1st and 2nd byte of the first element into each 16-bit word,
+    // but it only works within 128-bit lanes.
+    // For comparison:
+    //
+    //  - `_mm512_permutex_epi64` - needs F - 3 cycles latency
+    //  - `_mm512_shuffle_epi8` - needs BW - 1 cycle latency
+    //  - `_mm512_permutexvar_epi16` - needs BW - 4-6 cycles latency
+    //  - `_mm512_permutexvar_epi8` - needs VBMI - 3 cycles latency
     broadcast_first.zmm = _mm512_set1_epi16(0x0100);
-    // Within an iteration, we want to cycle through the elements of the `shorter_members`.
-    // Using "compress"-like instructions is, again, expensive, so let's create another
-    // mask for rotation of 16-bit words.
-    for (int i = 0; i < 32; i++)
-        rotate_first.u8[i] = (i + 1) * 2, rotate_first.u8[i + 1] = (i + 1) * 2 + 1;
-    rotate_first.u8[62] = 0;
-    rotate_first.u8[63] = 1;
 
 simsimd_intersect_u16_ice_cycle:
     // At any given cycle, make sure we use the shorter array as the first array.
@@ -213,7 +213,7 @@ simsimd_intersect_u16_ice_cycle_longer:
         longer_mask = 0xFFFFFFFF;
     }
     longer_members.zmm = _mm512_maskz_loadu_epi16(longer_mask, (__m512i const*)(longer + longer_idx));
-    shorter_member.zmm = _mm512_shuffle_epi8(shorter_members.zmm, broadcast_first.zmm);
+    shorter_member.zmm = _mm512_permutexvar_epi8(broadcast_first.zmm, shorter_members.zmm);
 
     // Compare `shorter_member` with each element in `longer_members.zmm`,
     // and jump to the position of the match. There can be only one match at most!
@@ -241,9 +241,10 @@ simsimd_intersect_u16_ice_cycle_longer:
     longer_idx += greater_count + equal_count;
 
     if (shorter_will_advance) {
-        if (shorter_remaining) {
-            --shorter_remaining;
-            shorter_members.zmm = _mm512_shuffle_epi8(shorter_members.zmm, rotate_first.zmm);
+        if (shorter_load_size) {
+            --shorter_load_size;
+            // TODO:
+            shorter_members.zmm = _mm512_alignr_epi32(shorter_members.zmm, shorter_members.zmm, 1);
             goto simsimd_intersect_u16_ice_cycle_longer;
         }
     } else
@@ -259,28 +260,57 @@ SIMSIMD_PUBLIC void simsimd_intersect_u32_ice(simsimd_u32_t const* shorter, sims
                                               simsimd_size_t shorter_length, simsimd_size_t longer_length,
                                               simsimd_distance_t* results) {
     simsimd_size_t intersection_count = 0;
-    simsimd_size_t shorter_idx = 0, longer_idx = 0;
-    simsimd_size_t longer_load_size;
-    __mmask16 longer_mask;
+    simsimd_size_t shorter_remaining = shorter_length, longer_remaining = longer_length;
+    simsimd_size_t shorter_load_size, longer_load_size;
+    __mmask16 shorter_mask, longer_mask;
+    __mmask16 equal_mask, greater_mask;
 
-    while (shorter_idx < shorter_length && longer_idx < longer_length) {
-        // Load `shorter_member` and broadcast it to shorter vector, load `longer_members_vec` from memory.
-        simsimd_size_t longer_remaining = longer_length - longer_idx;
-        simsimd_u32_t shorter_member = shorter[shorter_idx];
-        __m512i shorter_member_vec = _mm512_set1_epi32(*(int*)&shorter_member);
-        __m512i longer_members_vec;
-        if (longer_remaining < 16) {
-            longer_load_size = longer_remaining;
-            longer_mask = (__mmask16)_bzhi_u32(0xFFFF, longer_remaining);
-        } else {
-            longer_load_size = 16;
-            longer_mask = 0xFFFF;
-        }
-        longer_members_vec = _mm512_maskz_loadu_epi32(longer_mask, (__m512i const*)(longer + longer_idx));
+    union vec_t {
+        __m512i zmm;
+        simsimd_u32_t u32[16];
+        simsimd_u8_t u8[64];
+    } shorter_members, shorter_member, longer_members, broadcast_first, rotate_first;
 
-        // Compare `shorter_member` with each element in `longer_members_vec`,
+    // We will be walking through batches of elements from the shorter array,
+    // and comparing them with the longer array. The first element of the shorter
+    // array will be broadcasted to a vector. As there is no cheap `_mm512_permutexvar_epi16`-like
+    // instruction in AVX512, we couldt try using `vpshufb` via `_mm512_shuffle_epi8`,
+    // to load the 1st and 2nd byte of the first element into each 16-bit word,
+    // but it only works within 128-bit lanes.
+    // For comparison:
+    //
+    //  - `_mm512_permutex_epi64` - needs F - 3 cycles latency
+    //  - `_mm512_shuffle_epi8` - needs BW - 1 cycle latency
+    //  - `_mm512_permutexvar_epi16` - needs BW - 4-6 cycles latency
+    //  - `_mm512_permutexvar_epi8` - needs VBMI - 3 cycles latency
+    broadcast_first.zmm = _mm512_set1_epi32(0x03020100);
+
+simsimd_intersect_u32_ice_cycle:
+    // At any given cycle, make sure we use the shorter array as the first array.
+    if (shorter_remaining > longer_remaining) {
+        simsimd_u32_t const* temp_array = shorter;
+        shorter = longer, longer = temp_array;
+        simsimd_size_t temp_length = shorter_length;
+        shorter_length = longer_length, longer_length = temp_length;
+        simsimd_size_t temp_remaining = shorter_remaining;
+        shorter_remaining = longer_remaining, longer_remaining = temp_remaining;
+    }
+
+    // Estimate if we need to load the whole array or just a part of it.
+    shorter_load_size = shorter_remaining < 16 ? shorter_remaining : 16;
+    shorter_mask = (__mmask16)_bzhi_u32(0xFFFF, shorter_remaining);
+    longer_load_size = longer_remaining < 16 ? longer_remaining : 16;
+    longer_mask = (__mmask16)_bzhi_u32(0xFFFF, longer_remaining);
+    shorter_members.zmm = _mm512_maskz_loadu_epi32(shorter_mask, (__m512i const*)shorter);
+    longer_members.zmm = _mm512_maskz_loadu_epi32(longer_mask, (__m512i const*)longer);
+
+    // Now that we've loaded the chunks, compare them sliding through them.
+    do {
+        shorter_member.zmm = _mm512_permutexvar_epi8(broadcast_first.zmm, shorter_members.zmm);
+
+        // Compare `shorter_member` with each element in `longer_members.zmm`,
         // and jump to the position of the match. There can be only one match at most!
-        __mmask16 equal_mask = _mm512_mask_cmpeq_epu32_mask(longer_mask, shorter_member_vec, longer_members_vec);
+        equal_mask = _mm512_mask_cmpeq_epu32_mask(longer_mask, shorter_member.zmm, longer_members.zmm);
         simsimd_size_t equal_count = equal_mask != 0;
         intersection_count += equal_count;
 
@@ -289,30 +319,49 @@ SIMSIMD_PUBLIC void simsimd_intersect_u32_ice(simsimd_u32_t const* shorter, sims
         // - entries that scalar is equal to,
         // - entries that scalar is less than,
         // ... in that order! Any of them can be an empty set.
-        __mmask16 greater_mask = _mm512_mask_cmplt_epu32_mask(longer_mask, longer_members_vec, shorter_member_vec);
-        simsimd_size_t greater_count = _mm_popcnt_u32(greater_mask);
-        simsimd_size_t smaller_exists = longer_load_size > greater_count - equal_count;
+        greater_mask = _mm512_mask_cmplt_epu32_mask(longer_mask, longer_members.zmm, shorter_member.zmm);
+        int greater_count = _mm_popcnt_u32(greater_mask);
+        int smaller_exists = longer_load_size > greater_count - equal_count;
+        int shorter_will_advance = equal_count | smaller_exists;
 
         // Advance the first array:
         // - to the next element, if a match was found,
         // - to the next element, if the current element is smaller than any elements in the second array.
-        shorter_idx += equal_count | smaller_exists;
+        shorter += shorter_will_advance;
+        shorter_load_size -= shorter_will_advance;
+
         // Advance the second array:
         // - to the next element after match, if a match was found,
         // - to the first element that is greater than the current element in the first array, if no match was found.
-        longer_idx += greater_count + equal_count;
+        longer += greater_count + equal_count;
+        longer_load_size -= greater_count + equal_count;
 
-        // At any given cycle, take one entry from shorter array and compare it with multiple from the longer array.
-        // For that, we need to swap the arrays if necessary.
-        if ((shorter_length - shorter_idx) > (longer_length - longer_idx)) {
-            simsimd_u32_t const* temp_array = shorter;
-            shorter = longer, longer = temp_array;
-            simsimd_size_t temp_length = shorter_length;
-            shorter_length = longer_length, longer_length = temp_length;
-            simsimd_size_t temp_idx = shorter_idx;
-            shorter_idx = longer_idx, longer_idx = temp_idx;
-        }
+    } while (!_ktestz_mask16_u8(shorter_mask, longer_mask));
+
+simsimd_intersect_u32_ice_cycle_longer:
+    //
+    if (longer_remaining < 16) {
+        longer_load_size = longer_remaining;
+        longer_mask = (__mmask16)_bzhi_u32(0xFFFF, longer_remaining);
+    } else {
+        longer_load_size = 16;
+        longer_mask = 0xFFFF;
     }
+    longer_members.zmm = _mm512_maskz_loadu_epi32(longer_mask, (__m512i const*)(longer + longer_idx));
+
+    if (shorter_will_advance) {
+        if (shorter_load_size) {
+            --shorter_load_size;
+            shorter_members.zmm = _mm512_alignr_epi32(shorter_members.zmm, shorter_members.zmm, 1);
+            goto simsimd_intersect_u32_ice_cycle_longer;
+        }
+        if (shorter_idx < shorter_length && longer_idx < longer_length)
+            goto simsimd_intersect_u32_ice_cycle;
+    } else {
+        if (longer_idx < longer_length)
+            goto simsimd_intersect_u32_ice_cycle_longer;
+    }
+
     *results = intersection_count;
 }
 
